@@ -1,8 +1,14 @@
 {
-  "r_start_mm": 3.0,
-  "r_end_mm": 3.5,
-  "wire_width_um": 5.0,
-  "coil_spacing_um": 5.0,
+  "r_start_mm": 2,
+  "r_end_mm": 4,
+  "wire_width_um": 10.0,
+  "coil_spacing_um": 10.0,
   "wire_height_um": 1.0,
-  "current_mA": 1.0
+  "current_mA": 1.0,
+  "axis_z_min_mm": -1.0,
+  "axis_z_max_mm": 1.0,
+  "axis_z_num_points": 401,
+  "radial_r_min_mm": 0.0,
+  "radial_r_max_mm": 1.5,
+  "radial_r_num_points": 801
 }

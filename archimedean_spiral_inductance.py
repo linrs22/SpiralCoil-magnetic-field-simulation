@@ -183,14 +183,25 @@ def default_coil_geometry_path() -> Path:
     return Path(__file__).resolve().parent / "coil_geometry.json"
 
 
-def load_coil_geometry_json(path: Path) -> dict[str, float]:
-    """Load coil geometry from JSON. Required: r_start_mm, r_end_mm, wire_width_um, coil_spacing_um.
+def load_coil_config_json(path: Path) -> dict[str, Any]:
+    """Load coil geometry + magnetic-field sampling from one JSON file.
 
-    coil_spacing_um: edge-to-edge gap between adjacent turns (μm). Center pitch = width + gap.
+    Required geometry keys: r_start_mm, r_end_mm, wire_width_um, coil_spacing_um.
 
-    Optional: wire_height_um (default 1), current_mA (default 1).
+    Optional sampling (mm / counts), defaults match previous hard-coded behavior:
+      axis_z_min_mm, axis_z_max_mm, axis_z_num_points — on-axis line (0,0,z)
+      radial_r_min_mm, radial_r_max_mm, radial_r_num_points — line (r,0,z) in plane;
+          r is distance from origin along +x (y=0), i.e. cylindrical rho.
+
+    Optional geometry: wire_height_um (default 1), current_mA (default 1).
     """
     raw: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    geo = _parse_coil_geometry_raw(raw, path)
+    samp = _parse_sampling_raw(raw)
+    return {**geo, **samp}
+
+
+def _parse_coil_geometry_raw(raw: dict[str, Any], path: Path) -> dict[str, float]:
     required = ("r_start_mm", "r_end_mm", "wire_width_um", "coil_spacing_um")
     for key in required:
         if key not in raw:
@@ -223,6 +234,29 @@ def load_coil_geometry_json(path: Path) -> dict[str, float]:
         "pitch_cc_m": pitch_cc_m,
         "coil_spacing_um": coil_spacing_um,
         "current_a": current_mA * 1e-3,
+    }
+
+
+def _parse_sampling_raw(raw: dict[str, Any]) -> dict[str, float | int]:
+    z_lo = float(raw.get("axis_z_min_mm", -1.0))
+    z_hi = float(raw.get("axis_z_max_mm", 1.0))
+    z_n = int(raw.get("axis_z_num_points", 401))
+    r_lo = float(raw.get("radial_r_min_mm", 0.0))
+    r_hi = float(raw.get("radial_r_max_mm", 2.9))
+    r_n = int(raw.get("radial_r_num_points", 801))
+    if z_hi <= z_lo:
+        raise ValueError("axis_z_max_mm must be greater than axis_z_min_mm")
+    if r_hi < r_lo:
+        raise ValueError("radial_r_max_mm must be >= radial_r_min_mm")
+    if z_n < 2 or r_n < 2:
+        raise ValueError("axis_z_num_points and radial_r_num_points must be >= 2")
+    return {
+        "axis_z_min_m": z_lo * 1e-3,
+        "axis_z_max_m": z_hi * 1e-3,
+        "axis_z_num_points": z_n,
+        "radial_r_min_m": r_lo * 1e-3,
+        "radial_r_max_m": r_hi * 1e-3,
+        "radial_r_num_points": r_n,
     }
 
 
@@ -311,12 +345,12 @@ def compute_inductance(
 def run_field_study_default_output(config_path: Path | None = None) -> None:
     """Magnetic field CSVs; geometry from coil_geometry.json (or config_path)."""
     path = config_path if config_path is not None else default_coil_geometry_path()
-    g = load_coil_geometry_json(path)
-    r0 = g["r_start_m"]
-    r1 = g["r_end_m"]
-    width = g["width_m"]
-    height = g["height_m"]
-    pitch_cc = g["pitch_cc_m"]
+    cfg = load_coil_config_json(path)
+    r0 = cfg["r_start_m"]
+    r1 = cfg["r_end_m"]
+    width = cfg["width_m"]
+    height = cfg["height_m"]
+    pitch_cc = cfg["pitch_cc_m"]
     n_turns = archimedean_turns_from_radial_pitch(r0, r1, pitch_cc)
     # Along-wire resolution: aim ~80 um arc length per segment at mean radius.
     theta_max = 2.0 * math.pi * n_turns
@@ -334,15 +368,22 @@ def run_field_study_default_output(config_path: Path | None = None) -> None:
         width_m=width,
         height_m=height,
         n_turns=n_turns,
-        current_a=g["current_a"],
+        current_a=cfg["current_a"],
         n_theta=n_theta,
         n_width=n_width,
         n_height=n_height,
     )
 
-    z_axis = np.linspace(-1e-3, 1e-3, 401)
-    # 径向磁场只计算到线圈内侧附近（2.9 mm），不扫到外径以外
-    r_rad = np.linspace(0.0, 2.9e-3, 801)
+    z_axis = np.linspace(
+        cfg["axis_z_min_m"],
+        cfg["axis_z_max_m"],
+        cfg["axis_z_num_points"],
+    )
+    r_rad = np.linspace(
+        cfg["radial_r_min_m"],
+        cfg["radial_r_max_m"],
+        cfg["radial_r_num_points"],
+    )
     cutoff = 0.5 * max(coil.width_m, coil.height_m)
 
     src_pos, j_vec, vol_arr = build_coil_volume_elements(coil)
@@ -397,8 +438,14 @@ def run_field_study_default_output(config_path: Path | None = None) -> None:
     print(f"config: {path}")
     print(f"R_start={r0*1e3:.3f} mm, R_end={r1*1e3:.3f} mm, cross-section {width*1e6:.0f}x{height*1e6:.0f} um")
     print(
+        f"Sampling: z in [{cfg['axis_z_min_m']*1e3:.4f}, {cfg['axis_z_max_m']*1e3:.4f}] mm "
+        f"({cfg['axis_z_num_points']} pts); "
+        f"r in [{cfg['radial_r_min_m']*1e3:.4f}, {cfg['radial_r_max_m']*1e3:.4f}] mm "
+        f"({cfg['radial_r_num_points']} pts, line y=0)"
+    )
+    print(
         f"Turns N = {n_turns:.4f} (center pitch = {pitch_cc*1e6:.3f} um = "
-        f"{width*1e6:.3f} um width + {g['coil_spacing_um']:.3f} um gap)"
+        f"{width*1e6:.3f} um width + {cfg['coil_spacing_um']:.3f} um gap)"
     )
     print(f"I = {coil.current_a*1e3:.3f} mA, n_theta={coil.n_theta}, n_width={coil.n_width}, n_height={coil.n_height}")
     print(f"Volume sources = {src_pos.shape[0]}, cutoff = {cutoff*1e6:.2f} um")
