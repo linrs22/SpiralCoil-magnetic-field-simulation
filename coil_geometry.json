@@ -1,0 +1,8 @@
+{
+  "r_start_mm": 3.0,
+  "r_end_mm": 3.5,
+  "wire_width_um": 5.0,
+  "coil_spacing_um": 5.0,
+  "wire_height_um": 1.0,
+  "current_mA": 1.0
+}

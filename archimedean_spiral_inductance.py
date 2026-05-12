@@ -6,10 +6,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -177,6 +179,53 @@ def magnetic_energy_uniform_grid(
     return total / (2.0 * MU0)
 
 
+def default_coil_geometry_path() -> Path:
+    return Path(__file__).resolve().parent / "coil_geometry.json"
+
+
+def load_coil_geometry_json(path: Path) -> dict[str, float]:
+    """Load coil geometry from JSON. Required: r_start_mm, r_end_mm, wire_width_um, coil_spacing_um.
+
+    coil_spacing_um: edge-to-edge gap between adjacent turns (μm). Center pitch = width + gap.
+
+    Optional: wire_height_um (default 1), current_mA (default 1).
+    """
+    raw: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    required = ("r_start_mm", "r_end_mm", "wire_width_um", "coil_spacing_um")
+    for key in required:
+        if key not in raw:
+            raise KeyError(f"{path}: missing required key '{key}'")
+
+    r_start_mm = float(raw["r_start_mm"])
+    r_end_mm = float(raw["r_end_mm"])
+    wire_width_um = float(raw["wire_width_um"])
+    coil_spacing_um = float(raw["coil_spacing_um"])
+    wire_height_um = float(raw.get("wire_height_um", 1.0))
+    current_mA = float(raw.get("current_mA", 1.0))
+
+    if r_end_mm <= r_start_mm:
+        raise ValueError("r_end_mm must be greater than r_start_mm")
+    if wire_width_um <= 0.0 or coil_spacing_um < 0.0:
+        raise ValueError("wire_width_um must be positive; coil_spacing_um must be >= 0")
+    if wire_height_um <= 0.0:
+        raise ValueError("wire_height_um must be positive")
+
+    width_m = wire_width_um * 1e-6
+    pitch_cc_m = width_m + coil_spacing_um * 1e-6
+    if pitch_cc_m <= 0.0:
+        raise ValueError("center-to-center pitch (width + spacing) must be positive")
+
+    return {
+        "r_start_m": r_start_mm * 1e-3,
+        "r_end_m": r_end_mm * 1e-3,
+        "width_m": width_m,
+        "height_m": wire_height_um * 1e-6,
+        "pitch_cc_m": pitch_cc_m,
+        "coil_spacing_um": coil_spacing_um,
+        "current_a": current_mA * 1e-3,
+    }
+
+
 def archimedean_turns_from_radial_pitch(
     r_start_m: float,
     r_end_m: float,
@@ -259,12 +308,15 @@ def compute_inductance(
     }
 
 
-def run_field_study_default_output() -> None:
-    """User geometry: 50 turns (or ~10 um pitch = 5 um gap + 5 um width), I = 1 mA."""
-    r0, r1 = 3e-3, 3.5e-3
-    width, height = 5e-6, 1e-6
-    # 5 um gap between adjacent turns (edge-to-edge) + 5 um wire width => 10 um pitch.
-    pitch_cc = width + 5e-6
+def run_field_study_default_output(config_path: Path | None = None) -> None:
+    """Magnetic field CSVs; geometry from coil_geometry.json (or config_path)."""
+    path = config_path if config_path is not None else default_coil_geometry_path()
+    g = load_coil_geometry_json(path)
+    r0 = g["r_start_m"]
+    r1 = g["r_end_m"]
+    width = g["width_m"]
+    height = g["height_m"]
+    pitch_cc = g["pitch_cc_m"]
     n_turns = archimedean_turns_from_radial_pitch(r0, r1, pitch_cc)
     # Along-wire resolution: aim ~80 um arc length per segment at mean radius.
     theta_max = 2.0 * math.pi * n_turns
@@ -272,16 +324,20 @@ def run_field_study_default_output() -> None:
     ds_target = 80e-6
     n_theta = max(2000, int(theta_max * r_mean / ds_target) + 1)
 
+    # ~1 um resolution across conductor width; cap for very wide traces.
+    n_width = max(1, min(100, int(round(width * 1e6))))
+    n_height = max(1, int(round(height * 1e6)))
+
     coil = CoilParams(
         r_start_m=r0,
         r_end_m=r1,
         width_m=width,
         height_m=height,
         n_turns=n_turns,
-        current_a=1e-3,
+        current_a=g["current_a"],
         n_theta=n_theta,
-        n_width=5,
-        n_height=1,
+        n_width=n_width,
+        n_height=n_height,
     )
 
     z_axis = np.linspace(-1e-3, 1e-3, 401)
@@ -338,8 +394,12 @@ def run_field_study_default_output() -> None:
     ir0 = int(np.argmin(np.abs(r_rad)))
 
     print("=== Archimedean spiral magnetic field (Biot-Savart, uniform J) ===")
+    print(f"config: {path}")
     print(f"R_start={r0*1e3:.3f} mm, R_end={r1*1e3:.3f} mm, cross-section {width*1e6:.0f}x{height*1e6:.0f} um")
-    print(f"Turns N = {n_turns:.4f} (pitch cc = {pitch_cc*1e6:.1f} um => 5 um gap + 5 um width)")
+    print(
+        f"Turns N = {n_turns:.4f} (center pitch = {pitch_cc*1e6:.3f} um = "
+        f"{width*1e6:.3f} um width + {g['coil_spacing_um']:.3f} um gap)"
+    )
     print(f"I = {coil.current_a*1e3:.3f} mA, n_theta={coil.n_theta}, n_width={coil.n_width}, n_height={coil.n_height}")
     print(f"Volume sources = {src_pos.shape[0]}, cutoff = {cutoff*1e6:.2f} um")
     print(f"CPU time fields: {elapsed:.2f} s")
@@ -365,7 +425,13 @@ def main() -> None:
     parser.add_argument(
         "--fields",
         action="store_true",
-        help="Compute on-axis and in-plane radial B for default user geometry; write CSV.",
+        help="Compute on-axis and in-plane radial B from coil_geometry.json; write CSV.",
+    )
+    parser.add_argument(
+        "--coil-config",
+        type=Path,
+        default=None,
+        help="Path to coil geometry JSON (default: coil_geometry.json beside this script).",
     )
     parser.add_argument("--n-turns", type=float, default=10.0)
     parser.add_argument("--n-grid", type=int, default=33)
@@ -382,7 +448,14 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.fields:
-        run_field_study_default_output()
+        cfg = args.coil_config
+        if cfg is None:
+            cfg = default_coil_geometry_path()
+        else:
+            cfg = cfg.expanduser().resolve()
+        if not cfg.is_file():
+            raise FileNotFoundError(f"Coil config not found: {cfg}")
+        run_field_study_default_output(config_path=cfg)
         return
 
     coil = CoilParams(
